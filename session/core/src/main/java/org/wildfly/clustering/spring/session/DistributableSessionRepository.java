@@ -8,14 +8,19 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
+import java.util.function.Supplier;
 
 import org.springframework.context.ApplicationEvent;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.session.FindByIndexNameSessionRepository;
 import org.springframework.session.events.SessionCreatedEvent;
 import org.wildfly.clustering.cache.batch.Batch;
+import org.wildfly.clustering.cache.batch.BatchContext;
+import org.wildfly.clustering.cache.batch.SuspendedBatch;
 import org.wildfly.clustering.session.ImmutableSession;
 import org.wildfly.clustering.session.Session;
 import org.wildfly.clustering.session.SessionManager;
@@ -27,7 +32,8 @@ import org.wildfly.clustering.session.user.UserManager;
  * Additionally indexes sessions using a set of {@link UserManager} instances.
  * @author Paul Ferraro
  */
-public class DistributableSessionRepository implements FindByIndexNameSessionRepository<SpringSession> {
+public class DistributableSessionRepository implements FindByIndexNameSessionRepository<SpringSession>, AutoCloseable {
+	private static final System.Logger LOGGER = System.getLogger(DistributableSessionRepository.class.getPackageName());
 	// Handle redundant calls to findById(...)
 	private static final ThreadLocal<SpringSession> CURRENT_SESSION = new ThreadLocal<>();
 
@@ -35,6 +41,7 @@ public class DistributableSessionRepository implements FindByIndexNameSessionRep
 	private final ApplicationEventPublisher publisher;
 	private final BiConsumer<ImmutableSession, BiFunction<Object, org.springframework.session.Session, ApplicationEvent>> destroyAction;
 	private final UserConfiguration indexing;
+	private final StampedLock lifecycleLock = new StampedLock();
 
 	public DistributableSessionRepository(DistributableSessionRepositoryConfiguration configuration) {
 		this.manager = configuration.getSessionManager();
@@ -44,24 +51,21 @@ public class DistributableSessionRepository implements FindByIndexNameSessionRep
 	}
 
 	@Override
+	public void close() {
+		try {
+			this.lifecycleLock.writeLockInterruptibly();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	@Override
 	public SpringSession createSession() {
 		String id = this.manager.getIdentifierFactory().get();
-		boolean close = true;
-		Batch batch = this.manager.getBatchFactory().get();
-		try {
-			Session<Void> session = this.manager.createSession(id);
-			DistributableSession result = new DistributableSession(this.manager, session, batch.suspend(), this.indexing, this.destroyAction);
-			this.publisher.publishEvent(new SessionCreatedEvent(this, result));
-			close = false;
-			return result;
-		} catch (RuntimeException | Error e) {
-			batch.discard();
-			throw e;
-		} finally {
-			if (close) {
-				batch.close();
-			}
-		}
+		DistributableSession session = this.getSession(SessionManager::createSession, id);
+		this.publisher.publishEvent(new SessionCreatedEvent(this, session));
+		CURRENT_SESSION.set(session);
+		return session;
 	}
 
 	@Override
@@ -71,22 +75,27 @@ public class DistributableSessionRepository implements FindByIndexNameSessionRep
 		if ((current != null) && current.getId().equals(id)) {
 			return current;
 		}
-		boolean close = true;
-		Batch batch = this.manager.getBatchFactory().get();
-		try {
-			Session<Void> session = this.manager.findSession(id);
-			if (session == null) return null;
-			DistributableSession result = new DistributableSession(this.manager, session, batch.suspend(), this.indexing, this.destroyAction);
-			close = false;
-			CURRENT_SESSION.set(result);
-			return result;
-		} catch (RuntimeException | Error e) {
-			batch.discard();
-			throw e;
-		} finally {
-			if (close) {
-				batch.close();
+		DistributableSession session = this.getSession(SessionManager::findSession, id);
+		if (session != null) {
+			CURRENT_SESSION.set(session);
+		}
+		return session;
+	}
+
+	private DistributableSession getSession(BiFunction<SessionManager<Void>, String, Session<Void>> function, String id) {
+		Map.Entry<SuspendedBatch, Runnable> entry = this.createBatchEntry();
+		SuspendedBatch suspendedBatch = entry.getKey();
+		Runnable closeTask = entry.getValue();
+		try (BatchContext<Batch> context = suspendedBatch.resumeWithContext()) {
+			Session<Void> session = function.apply(this.manager, id);
+			if ((session == null) || !session.isValid() || session.getMetaData().isExpired()) {
+				rollback(context, closeTask);
+				return null;
 			}
+			return new DistributableSession(this.manager, session, suspendedBatch, closeTask, this.indexing, this.destroyAction);
+		} catch (RuntimeException | Error e) {
+			rollback(suspendedBatch::resume, closeTask);
+			throw e;
 		}
 	}
 
@@ -103,8 +112,10 @@ public class DistributableSessionRepository implements FindByIndexNameSessionRep
 
 	@Override
 	public void save(SpringSession session) {
-		CURRENT_SESSION.remove();
-		session.close();
+		if (CURRENT_SESSION.get() != null) {
+			CURRENT_SESSION.remove();
+			session.close();
+		}
 	}
 
 	@Override
@@ -132,5 +143,44 @@ public class DistributableSessionRepository implements FindByIndexNameSessionRep
 			return result;
 		}
 		return Collections.emptyMap();
+	}
+
+	private Map.Entry<SuspendedBatch, Runnable> createBatchEntry() {
+		Runnable closeTask = this.getSessionCloseTask();
+		try {
+			return Map.entry(this.manager.getBatchFactory().get().suspend(), closeTask);
+		} catch (RuntimeException | Error e) {
+			closeTask.run();
+			throw e;
+		}
+	}
+
+	private static void rollback(Supplier<Batch> batchSupplier, Runnable closeTask) {
+		try (Batch batch = batchSupplier.get()) {
+			batch.discard();
+		} catch (RuntimeException | Error e) {
+			LOGGER.log(System.Logger.Level.WARNING, e.getLocalizedMessage(), e);
+		} finally {
+			closeTask.run();
+		}
+	}
+
+	private Runnable getSessionCloseTask() {
+		StampedLock lock = this.lifecycleLock;
+		long stamp = lock.tryReadLock();
+		if (!StampedLock.isReadLockStamp(stamp)) {
+			throw new IllegalStateException();
+		}
+		AtomicLong stampRef = new AtomicLong(stamp);
+		return new Runnable() {
+			@Override
+			public void run() {
+				// Ensure we only unlock once.
+				long stamp = stampRef.getAndSet(0L);
+				if (StampedLock.isReadLockStamp(stamp)) {
+					lock.unlockRead(stamp);
+				}
+			}
+		};
 	}
 }
